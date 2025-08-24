@@ -233,7 +233,24 @@ st.dataframe(df_raw.head())
 # Coerce numeric-likes, select features, impute
 df = coerce_numeric_like(df_raw)
 num_cols_all, cat_small, cat_dropped = select_features(df)
+
+# --- NEW: capture imputation maps used during training so we can reuse at predict time ---
+numeric_impute_map = {}
+under_for_map = df[df[TARGET_COL] == NEG_LABEL]
+num_cols_tmp = df.select_dtypes(include=["number"]).columns.tolist()
+num_cols_tmp = [c for c in num_cols_tmp if c != ID_COL]
+for c in num_cols_tmp:
+    m = under_for_map[c].mean(skipna=True)
+    if pd.isna(m): m = df[c].mean(skipna=True)
+    numeric_impute_map[c] = m
+
 df = impute_numeric_under_patron(df)
+
+categorical_impute_map = {}
+for c in cat_small:
+    if c in df.columns and not df[c].dropna().empty:
+        categorical_impute_map[c] = df[c].mode(dropna=True)[0]
+
 df = impute_categoricals_mode(df, cat_small)
 
 # Build X/y and final lists (exclude ID)
@@ -371,7 +388,8 @@ pipe = Pipeline([("prep", pre), ("clf", clf)])
 
 # Cache artifacts (so threshold updates don't retrain)
 for k in ["pipe", "probs_te", "classes_", "y_te", "ids_te", "feature_names",
-          "suggested_thr", "suggested_prec", "suggested_rec"]:
+          "suggested_thr", "suggested_prec", "suggested_rec",
+          "numeric_impute_map", "categorical_impute_map", "required_cols"]:
     st.session_state.setdefault(k, None)
 
 if st.button("Train (optimize for Patron+)"):
@@ -398,13 +416,11 @@ if st.button("Train (optimize for Patron+)"):
         probs_te = pipe.predict_proba(X_te)
         # For XGB, classes_ are [0,1]; remap to [NEG_LABEL, POS_LABEL] for the UI
         if model_choice.startswith("XGBoost"):
-            # Ensure 2D probs (n,2). Some versions might return (n,) for binary; handle it:
             if probs_te.ndim == 1:
                 probs_te = np.vstack([1 - probs_te, probs_te]).T
             classes_display = [NEG_LABEL, POS_LABEL]
         else:
             classes_model = pipe.named_steps["clf"].classes_.tolist()
-            # Make sure Patron+ is recognized; otherwise keep model order
             classes_display = classes_model
         st.session_state.probs_te = probs_te
         st.session_state.classes_ = classes_display
@@ -420,6 +436,14 @@ if st.button("Train (optimize for Patron+)"):
 
     st.session_state.y_te = y_te
     st.session_state.ids_te = ids_te
+
+    # --- NEW: remember imputation maps & required cols for prediction ---
+    st.session_state.numeric_impute_map = numeric_impute_map
+    st.session_state.categorical_impute_map = categorical_impute_map
+    if model_choice == "KNN (Haversine lat/lon)":
+        st.session_state.required_cols = [lat_col, lon_col]
+    else:
+        st.session_state.required_cols = (num_cols or []) + (cat_cols or [])
 
     # ---- GREEN BANNER: F1-optimal threshold (read-only) ----
     try:
@@ -559,3 +583,93 @@ if st.session_state.pipe is not None:
     )
 else:
     st.info("Train a model to enable download.")
+
+# ================================
+# ### PREDICTION SECTION (NEW) ###
+# ================================
+st.subheader("Predict with current model")
+if st.session_state.pipe is None:
+    st.info("Train a model above to enable predictions.")
+else:
+    pred_csv = st.file_uploader(
+        "Upload CSV to score (must include 'customer_no'; target not required)",
+        type=["csv"],
+        key="pred_uploader",
+        help="We’ll validate columns against the last trained model."
+    )
+
+    if st.button("Predict with last trained model"):
+        if pred_csv is None:
+            st.error("Please upload a CSV to score."); 
+        else:
+            try:
+                df_pred_raw = pd.read_csv(pred_csv)
+            except Exception as e:
+                st.error(f"Could not read prediction CSV: {e}")
+            else:
+                # Validate ID column
+                if ID_COL not in df_pred_raw.columns:
+                    st.error(f"Missing required ID column '{ID_COL}'.")
+                else:
+                    # Prepare like training: coerce + impute using stored maps
+                    df_pred = coerce_numeric_like(df_pred_raw.copy())
+
+                    # Apply saved imputation values from training
+                    num_map = st.session_state.get("numeric_impute_map", {}) or {}
+                    for c, m in num_map.items():
+                        if c in df_pred.columns:
+                            df_pred[c] = df_pred[c].fillna(m)
+
+                    cat_map = st.session_state.get("categorical_impute_map", {}) or {}
+                    for c, mv in cat_map.items():
+                        if c in df_pred.columns:
+                            df_pred[c] = df_pred[c].fillna(mv)
+
+                    # Confirm required feature columns exist
+                    required_cols = st.session_state.get("required_cols", []) or []
+                    missing = [c for c in required_cols if c not in df_pred.columns]
+                    if missing:
+                        st.error(f"Missing required columns for this model: {missing}")
+                    else:
+                        # Build X for pipeline (drop target if present)
+                        X_pred_full = df_pred.drop(columns=[TARGET_COL], errors="ignore")
+
+                        # Predict probabilities
+                        try:
+                            probs = st.session_state.pipe.predict_proba(X_pred_full)
+                        except Exception as e:
+                            st.error(f"Prediction failed. Check column types match training set. Details: {e}")
+                        else:
+                            # Find index for Patron+ prob
+                            classes = st.session_state.classes_ or []
+                            if POS_LABEL in classes:
+                                pos_idx = classes.index(POS_LABEL)
+                            else:
+                                pos_idx = int(np.argmax(np.mean(probs, axis=0)))
+
+                            # Ensure 2D
+                            if probs.ndim == 1:
+                                probs = np.vstack([1 - probs, probs]).T
+
+                            pos_probs = probs[:, pos_idx]
+                            thr = float(st.session_state.desired_thr)
+                            preds = np.where(pos_probs >= thr, POS_LABEL, NEG_LABEL)
+
+                            out = pd.DataFrame({
+                                ID_COL: df_pred_raw[ID_COL].astype(str).values,
+                                f"proba_{POS_LABEL}": pos_probs,
+                                "prediction": preds
+                            })
+
+                            st.success("Predictions ready.")
+                            st.dataframe(out.head(20))
+
+                            # Download CSV
+                            pred_bytes = out.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "Download predictions CSV",
+                                data=pred_bytes,
+                                file_name="aria_predictions.csv",
+                                mime="text/csv",
+                                help="Includes customer_no, proba for Patron+, and the final prediction using your current threshold."
+                            )
