@@ -551,125 +551,35 @@ with st.expander("Show transformed features head (MinMax + OHE or lat/lon→radi
     except Exception as e:
         st.info(f"Transform preview not available: {e}")
 
-# ------------------- Download bundle -------------------
-st.subheader("Download optimized model")
+# ------------------- Download metadata bundle -------------------
+st.subheader("Download optimized model (metadata only)")
 if st.session_state.pipe is not None:
-    bundle = {
-        "pipeline": st.session_state.pipe,
+    bundle_meta = {
+        "model_choice": model_choice,
+        "hyperparams": st.session_state.pipe.named_steps["clf"].get_params(deep = False),
+        "numeric_columns": num_cols,
+        "categorical_columns_used": cat_cols,
+        "dropped_categorical_columns": cat_dropped,
+        "id_column": ID_COL,
+        "target_column": TARGET_COL,
         "threshold": float(st.session_state.desired_thr),
         "positive_label": POS_LABEL,
-        "classes_": st.session_state.classes_,  # always string labels for UI
-        "metadata": {
-            "id_column": ID_COL,
-            "target_column": TARGET_COL,
-            "model_choice": model_choice,
-            "test_size": float(test_size),
-            "numeric_columns": num_cols,
-            "categorical_columns_used": cat_cols,          # only 2–5 uniques
-            "dropped_categorical_columns": cat_dropped,    # everything else
-            "haversine_lat_col": lat_col if model_choice == "KNN (Haversine lat/lon)" else None,
-            "haversine_lon_col": lon_col if model_choice == "KNN (Haversine lat/lon)" else None,
-            "xgboost_label_mapping": {NEG_LABEL: 0, POS_LABEL: 1} if model_choice.startswith("XGBoost") else None,
-        }
+        "classes_": st.session_state.classes_,
     }
+
+    # ✅ Show confirmation of what’s inside
+    st.success("Metadata bundle created successfully!")
+    st.write("Keys in this bundle:", list(bundle_meta.keys()))
+
     buf = io.BytesIO()
-    joblib.dump(bundle, buf); buf.seek(0)
+    joblib.dump(pipe, buf); buf.seek(0)
+
     st.download_button(
-        "Download .pkl bundle",
+        "Download Metadata Bundle (.pkl)",
         data=buf,
-        file_name="aria_patronplus.pkl",
+        file_name="aria_metadata.pkl",
         mime="application/octet-stream",
-        help="Trained pipeline + your decision threshold + class mapping + feature metadata."
+        help="For stacking: saves only model type, hyperparams, and schema info (no fitted pipeline)."
     )
 else:
     st.info("Train a model to enable download.")
-
-# ================================
-# ### PREDICTION SECTION (NEW) ###
-# ================================
-st.subheader("Predict with current model")
-if st.session_state.pipe is None:
-    st.info("Train a model above to enable predictions.")
-else:
-    pred_csv = st.file_uploader(
-        "Upload CSV to score (must include 'customer_no'; target not required)",
-        type=["csv"],
-        key="pred_uploader",
-        help="We’ll validate columns against the last trained model."
-    )
-
-    if st.button("Predict with last trained model"):
-        if pred_csv is None:
-            st.error("Please upload a CSV to score."); 
-        else:
-            try:
-                df_pred_raw = pd.read_csv(pred_csv)
-            except Exception as e:
-                st.error(f"Could not read prediction CSV: {e}")
-            else:
-                # Validate ID column
-                if ID_COL not in df_pred_raw.columns:
-                    st.error(f"Missing required ID column '{ID_COL}'.")
-                else:
-                    # Prepare like training: coerce + impute using stored maps
-                    df_pred = coerce_numeric_like(df_pred_raw.copy())
-
-                    # Apply saved imputation values from training
-                    num_map = st.session_state.get("numeric_impute_map", {}) or {}
-                    for c, m in num_map.items():
-                        if c in df_pred.columns:
-                            df_pred[c] = df_pred[c].fillna(m)
-
-                    cat_map = st.session_state.get("categorical_impute_map", {}) or {}
-                    for c, mv in cat_map.items():
-                        if c in df_pred.columns:
-                            df_pred[c] = df_pred[c].fillna(mv)
-
-                    # Confirm required feature columns exist
-                    required_cols = st.session_state.get("required_cols", []) or []
-                    missing = [c for c in required_cols if c not in df_pred.columns]
-                    if missing:
-                        st.error(f"Missing required columns for this model: {missing}")
-                    else:
-                        # Build X for pipeline (drop target if present)
-                        X_pred_full = df_pred.drop(columns=[TARGET_COL], errors="ignore")
-
-                        # Predict probabilities
-                        try:
-                            probs = st.session_state.pipe.predict_proba(X_pred_full)
-                        except Exception as e:
-                            st.error(f"Prediction failed. Check column types match training set. Details: {e}")
-                        else:
-                            # Find index for Patron+ prob
-                            classes = st.session_state.classes_ or []
-                            if POS_LABEL in classes:
-                                pos_idx = classes.index(POS_LABEL)
-                            else:
-                                pos_idx = int(np.argmax(np.mean(probs, axis=0)))
-
-                            # Ensure 2D
-                            if probs.ndim == 1:
-                                probs = np.vstack([1 - probs, probs]).T
-
-                            pos_probs = probs[:, pos_idx]
-                            thr = float(st.session_state.desired_thr)
-                            preds = np.where(pos_probs >= thr, POS_LABEL, NEG_LABEL)
-
-                            out = pd.DataFrame({
-                                ID_COL: df_pred_raw[ID_COL].astype(str).values,
-                                f"proba_{POS_LABEL}": pos_probs,
-                                "prediction": preds
-                            })
-
-                            st.success("Predictions ready.")
-                            st.dataframe(out.head(20))
-
-                            # Download CSV
-                            pred_bytes = out.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "Download predictions CSV",
-                                data=pred_bytes,
-                                file_name="aria_predictions.csv",
-                                mime="text/csv",
-                                help="Includes customer_no, proba for Patron+, and the final prediction using your current threshold."
-                            )
